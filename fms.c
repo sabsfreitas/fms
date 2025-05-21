@@ -3,120 +3,96 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/resource.h>
-#include <sys/sysinfo.h>
-#include <signal.h>
 #include <sys/wait.h>
+#include <signal.h>
 
-void solicita_dados(char *binario, int *cpu_quota, int *timeout, long *mem_max) {
-    char buffer[256];
+typedef struct {
+    int cpu_quota, cpu_usado, timeout;
+    long mem_max, mem_usada;
+} Recursos;
 
-    printf("Digite o comando a ser executado: ");
-    fgets(binario, 256, stdin);
-    binario[strcspn(binario, "\n")] = 0; // remove \n do final
-
-    printf("Digite o tempo máximo de CPU (em segundos): ");
-    fgets(buffer, sizeof(buffer), stdin);
-    sscanf(buffer, "%d", cpu_quota);
-
-    printf("Digite o tempo máximo de execução (em segundos): ");
-    fgets(buffer, sizeof(buffer), stdin);
-    sscanf(buffer, "%d", timeout);
-
-    printf("Digite o limite máximo de memória (em KB): ");
-    fgets(buffer, sizeof(buffer), stdin);
-    sscanf(buffer, "%ld", mem_max);
+void solicitar_limites(Recursos *r) {
+    printf("Quota de CPU (s): "); scanf("%d", &r->cpu_quota);
+    printf("Timeout por execução (s): "); scanf("%d", &r->timeout);
+    printf("Memória máxima (KB): "); scanf("%ld", &r->mem_max);
+    r->cpu_usado = 0; r->mem_usada = 0;
 }
 
-long monitor(int pid, int timeout, int cpu_quota, long mem_max) {
-    struct rusage usage;
-    int status;
-    int tempo_espera = 0;
+int monitorar(int pid, Recursos *r) {
+    struct rusage uso_ini, uso_fim;
+    int status, tempo = 0;
 
-    // verifica a cada 1 segundo se o processo terminou até atingir o timeout
-    while (tempo_espera < timeout) {
-        int result = waitpid(pid, &status, WNOHANG);
-        if (result == pid) {
-            break;
-        }
-
+    getrusage(RUSAGE_CHILDREN, &uso_ini);
+    while (tempo++ < r->timeout) {
+        if (waitpid(pid, &status, WNOHANG) == pid) break;
         sleep(1);
-        tempo_espera++;
     }
 
-    // se o tempo estourou, mata o processo
-    if (tempo_espera >= timeout) {
-        printf("Tempo limite atingido! Matando o processo...\n");
+    if (tempo > r->timeout) {
+        printf("Timeout expirado! Matando processo...\n");
         kill(pid, SIGKILL);
-        waitpid(pid, &status, 0); // garantir que foi coletado
+        waitpid(pid, &status, 0);
     }
 
-    // coleta dados de uso de CPU e memória
-    getrusage(RUSAGE_CHILDREN, &usage);
+    getrusage(RUSAGE_CHILDREN, &uso_fim);
 
-    long cpu_user = usage.ru_utime.tv_sec;
-    long cpu_sys  = usage.ru_stime.tv_sec;
-    long cpu_total = cpu_user + cpu_sys;
+    double cpu = (uso_fim.ru_utime.tv_sec - uso_ini.ru_utime.tv_sec)
+               + (uso_fim.ru_stime.tv_sec - uso_ini.ru_stime.tv_sec)
+               + (uso_fim.ru_utime.tv_usec - uso_ini.ru_utime.tv_usec) / 1e6
+               + (uso_fim.ru_stime.tv_usec - uso_ini.ru_stime.tv_usec) / 1e6;
 
-    printf("Tempo de CPU (usuário + sistema): %ld s\n", cpu_total);
+    long mem = uso_fim.ru_maxrss;
 
-    if (cpu_total > cpu_quota) {
-        printf("Limite de CPU excedido!\n");
-        printf("Encerrando FMS.\n");
-        exit(0);
+    printf("CPU: %.2fs | Memória: %ld KB\n", cpu, mem);
+
+    r->cpu_usado += (int)cpu;
+    if (mem > r->mem_usada) r->mem_usada = mem;
+
+    if (r->cpu_usado > r->cpu_quota) {
+        printf("Quota de CPU excedida!\n");
+        return 0;
     }
 
-    long mem_used = usage.ru_maxrss; // em KB no Linux
-    printf("Memória máxima usada: %ld KB\n", mem_used);
-
-    if (mem_used > mem_max) {
+    if (r->mem_usada > r->mem_max) {
         printf("Limite de memória excedido!\n");
-        printf("Encerrando FMS.\n");
-        exit(0);
+        return 0;
     }
-    return cpu_total;
+
+    return 1;
 }
 
+int executar(char *bin, Recursos *r) {
+    int pid = fork();
+    if (pid < 0) {
+        perror("Erro no fork");
+        return 0;
+    } else if (pid == 0) {
+        execlp(bin, bin, NULL);
+        perror("Erro ao executar");
+        exit(1);
+    }
+    return monitorar(pid, r);
+}
 
 int main() {
-    char binario[256];
-    int cpu_quota;        // em segundos
-    int timeout;          // em segundos
-    long mem_max;         // em KB
-    long cpu_restante;
+    char bin[256];
+    Recursos r;
+
+    printf("=== FURG METERED SHELL (FMS) ===\n");
+    solicitar_limites(&r);
 
     while (1) {
-        solicita_dados(binario, &cpu_quota, &timeout, &mem_max);
-        cpu_restante = cpu_quota;
+        printf("\nDigite o binário (ou 'sair'): ");
+        scanf(" %[^\n]", bin);
 
-        int pid = fork();
+        if (strcmp(bin, "sair") == 0) break;
+        if (!executar(bin, &r)) break;
 
-        if (pid == 0) {
-            // Processo filho: executa o binário
-            char *argv[2];
-            argv[0] = binario;
-            argv[1] = NULL;
-            execvp(binario, argv);
-            printf("Erro ao executar o binário");
-            exit(EXIT_FAILURE);
-        } else if (pid > 0) {
-            // Processo pai: monitora
-            long cpu_usado = monitor(pid, timeout, cpu_quota, mem_max);
-            cpu_restante -= cpu_usado;
-            if (cpu_restante <= 0)
-            {
-                printf("Quota de CPU esgotada. Encerrando FMS.\n");
-                break;
-            }
-        } else {
-            printf("Erro no fork");
-            exit(EXIT_FAILURE);
-        }
-        char continuar;
-        char buffer[10];
-        printf("Deseja executar outro programa? (s/n): ");
-        fgets(buffer, sizeof(buffer), stdin);
-        sscanf(buffer, " %c", &continuar);
+        printf("CPU restante: %d s | Memória restante: %ld KB\n",
+            r.cpu_quota - r.cpu_usado,
+            (r.mem_max > r.mem_usada) ? r.mem_max - r.mem_usada : 0);
     }
 
+    printf("=== FIM DO FMS ===\n");
     return 0;
 }
