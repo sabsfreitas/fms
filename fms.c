@@ -22,7 +22,9 @@ int monitorar(int pid, Recursos *r) {
     struct rusage uso_ini, uso_fim;
     int status, tempo = 0;
 
-    getrusage(RUSAGE_CHILDREN, &uso_ini);
+    // monitora tempo de execução do processo filho
+    getrusage(RUSAGE_CHILDREN, &uso_ini); // estatísticas iniciais de uso de recursos
+    // lógica do timeout
     while (tempo++ < r->timeout) {
         if (waitpid(pid, &status, WNOHANG) == pid) break;
         sleep(1);
@@ -34,8 +36,9 @@ int monitorar(int pid, Recursos *r) {
         waitpid(pid, &status, 0);
     }
 
-    getrusage(RUSAGE_CHILDREN, &uso_fim);
+    getrusage(RUSAGE_CHILDREN, &uso_fim); // estatísticas finais de uso de recursos
 
+    // calcula o uso de CPU (usuario + sys) e memória
     double cpu = (uso_fim.ru_utime.tv_sec - uso_ini.ru_utime.tv_sec)
                + (uso_fim.ru_stime.tv_sec - uso_ini.ru_stime.tv_sec)
                + (uso_fim.ru_utime.tv_usec - uso_ini.ru_utime.tv_usec) / 1e6
@@ -43,10 +46,10 @@ int monitorar(int pid, Recursos *r) {
 
     long mem = uso_fim.ru_maxrss;
 
-    printf("CPU: %.2fs | Memória: %ld KB\n", cpu, mem);
+    printf("CPU usado: %.2fs | Memória usada: %ld KB\n", cpu, mem);
 
-    r->cpu_usado += (int)cpu;
-    if (mem > r->mem_usada) r->mem_usada = mem;
+    r->cpu_usado += (int)cpu; // cpu acumulado
+    if (mem > r->mem_usada) r->mem_usada = mem; // memória máxima usada
 
     if (r->cpu_usado > r->cpu_quota) {
         printf("Quota de CPU excedida!\n");
