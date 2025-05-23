@@ -5,6 +5,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <time.h>
 
 typedef struct {
     int cpu_quota, cpu_usado, timeout;
@@ -20,25 +21,26 @@ void solicitar_limites(Recursos *r) {
 
 int monitorar(int pid, Recursos *r) {
     struct rusage uso_ini, uso_fim;
-    int status, tempo = 0;
-
-    // monitora tempo de execução do processo filho
-    getrusage(RUSAGE_CHILDREN, &uso_ini); // estatísticas iniciais de uso de recursos
-    // lógica do timeout
-    while (tempo++ < r->timeout) {
+    int status;
+    time_t inicio;
+    
+    getrusage(RUSAGE_CHILDREN, &uso_ini);
+    time(&inicio);
+    
+    while (1) {
         if (waitpid(pid, &status, WNOHANG) == pid) break;
+        if (time(NULL) - inicio >= r->timeout) {
+            printf("Timeout expirado! Matando processo...\n");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            break;
+        }
         sleep(1);
     }
 
-    if (tempo > r->timeout) {
-        printf("Timeout expirado! Matando processo...\n");
-        kill(pid, SIGKILL);
-        waitpid(pid, &status, 0);
-    }
+    getrusage(RUSAGE_CHILDREN, &uso_fim);
 
-    getrusage(RUSAGE_CHILDREN, &uso_fim); // estatísticas finais de uso de recursos
-
-    // calcula o uso de CPU (usuario + sys) e memória
+    // calcula CPU usando rusage (usuario + sistema)
     double cpu = (uso_fim.ru_utime.tv_sec - uso_ini.ru_utime.tv_sec)
                + (uso_fim.ru_stime.tv_sec - uso_ini.ru_stime.tv_sec)
                + (uso_fim.ru_utime.tv_usec - uso_ini.ru_utime.tv_usec) / 1e6
@@ -46,54 +48,65 @@ int monitorar(int pid, Recursos *r) {
 
     long mem = uso_fim.ru_maxrss;
 
-    printf("CPU usado: %.2fs | Memória usada: %ld KB\n", cpu, mem);
+    printf("Processo atual: CPU usado: %.2fs | Memória usada: %ld KB\n", cpu, mem);
+    
+    // Só registra recursos se o binário executou (não falhou no execvp)
+    if ((WIFEXITED(status) && WEXITSTATUS(status) != 127) || WIFSIGNALED(status)) {
 
-    r->cpu_usado += (int)cpu; // cpu acumulado
-    if (mem > r->mem_usada) r->mem_usada = mem; // memória máxima usada
-
-    if (r->cpu_usado > r->cpu_quota) {
-        printf("Quota de CPU excedida!\n");
-        return 0;
-    }
-
-    if (r->mem_usada > r->mem_max) {
-        printf("Limite de memória excedido!\n");
-        return 0;
+        r->cpu_usado += (int)cpu; 
+        if (mem > r->mem_usada) r->mem_usada = mem;
+        
+        printf("Acumulado: CPU: %d/%d s (%.1f%%) | Memória: %ld/%ld KB (%.1f%%)\n", 
+               r->cpu_usado, r->cpu_quota, 
+               (r->cpu_quota > 0) ? (r->cpu_usado * 100.0 / r->cpu_quota) : 0,
+               r->mem_usada, r->mem_max, 
+               (r->mem_max > 0) ? (r->mem_usada * 100.0 / r->mem_max) : 0);
+    
+        
+        if (r->cpu_usado > r->cpu_quota) {
+            printf("Quota de CPU excedida!\n");
+            return 0;
+        }
+        if (r->mem_usada > r->mem_max) {
+            printf("Limite de memória excedido!\n");
+            return 0;
+        }
+    } else {
+        printf("Execução falhou - recursos não descontados\n");
     }
 
     return 1;
 }
 
-int executar(char *bin, Recursos *r) {
+int executar(char *cmd, Recursos *r) {
+    if (cmd[0] == '\0') return 1;
+    
     int pid = fork();
     if (pid < 0) {
         perror("Erro no fork");
         return 0;
     } else if (pid == 0) {
-        execlp(bin, bin, NULL);
+        char *args[] = {cmd, NULL};
+        execvp(cmd, args);
         perror("Erro ao executar");
-        exit(1);
+        exit(127);
     }
     return monitorar(pid, r);
 }
 
 int main() {
-    char bin[256];
+    char cmd[256];
     Recursos r;
 
     printf("=== FURG METERED SHELL (FMS) ===\n");
     solicitar_limites(&r);
 
     while (1) {
-        printf("\nDigite o binário (ou 'sair'): ");
-        scanf(" %[^\n]", bin);
+        printf("\nDigite o comando (ou 'sair'): ");
+        scanf(" %[^\n]", cmd);
 
-        if (strcmp(bin, "sair") == 0) break;
-        if (!executar(bin, &r)) break;
-
-        printf("CPU restante: %d s | Memória restante: %ld KB\n",
-            r.cpu_quota - r.cpu_usado,
-            (r.mem_max > r.mem_usada) ? r.mem_max - r.mem_usada : 0);
+        if (strcmp(cmd, "sair") == 0) break;
+        if (!executar(cmd, &r)) break;
     }
 
     printf("=== FIM DO FMS ===\n");
